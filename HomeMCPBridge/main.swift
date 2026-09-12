@@ -618,7 +618,243 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         }
     }
 
+    func listScenes(homeName: String? = nil) -> [[String: Any]] {
+        homes(matching: homeName).flatMap { home in
+            home.actionSets.map { actionSet in
+                [
+                    "id": actionSet.uniqueIdentifier.uuidString,
+                    "name": actionSet.name,
+                    "home": home.name,
+                    "actionCount": actionSet.actions.count,
+                    "isExecuting": actionSet.isExecuting,
+                    "lastExecutedAt": actionSet.lastExecutionDate?.ISO8601Format() as Any
+                ]
+            }
+        }
+    }
+
+    func listAutomations(homeName: String? = nil) -> [[String: Any]] {
+        homes(matching: homeName).flatMap { home in
+            home.triggers.map { trigger in
+                var result: [String: Any] = [
+                    "id": trigger.uniqueIdentifier.uuidString,
+                    "name": trigger.name,
+                    "home": home.name,
+                    "enabled": trigger.isEnabled,
+                    "scenes": trigger.actionSets.map(\.name)
+                ]
+                if let timer = trigger as? HMTimerTrigger {
+                    result["type"] = "timer"
+                    result["fireDate"] = timer.fireDate.ISO8601Format()
+                    if let recurrence = timer.recurrence {
+                        result["recurrenceMinutes"] = recurrence.minute as Any
+                    }
+                } else if trigger is HMEventTrigger {
+                    result["type"] = "event"
+                } else {
+                    result["type"] = "unknown"
+                }
+                return result
+            }
+        }
+    }
+
+    func activateScene(name: String, homeName: String? = nil, completion: @escaping ([String: Any]) -> Void) {
+        guard let (home, scene) = findScene(name: name, homeName: homeName) else {
+            completion(["success": false, "error": "Scene not found: \(name)"])
+            return
+        }
+
+        home.executeActionSet(scene) { error in
+            if let error {
+                completion(["success": false, "error": error.localizedDescription])
+            } else {
+                completion(["success": true, "scene": scene.name, "home": home.name])
+            }
+        }
+    }
+
+    func createScene(name: String, homeName: String?, actionSpecs: [[String: Any]], completion: @escaping ([String: Any]) -> Void) {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion(["success": false, "error": "Scene name cannot be empty"])
+            return
+        }
+        guard !actionSpecs.isEmpty else {
+            completion(["success": false, "error": "A scene needs at least one action"])
+            return
+        }
+        guard let home = homes(matching: homeName).first else {
+            completion(["success": false, "error": homeName == nil ? "No HomeKit home is available" : "Home not found: \(homeName!)"])
+            return
+        }
+        guard home.actionSets.allSatisfy({ $0.name.caseInsensitiveCompare(name) != .orderedSame }) else {
+            completion(["success": false, "error": "A scene named '\(name)' already exists in \(home.name)"])
+            return
+        }
+
+        var writes: [(characteristic: HMCharacteristic, value: NSNumber)] = []
+        for spec in actionSpecs {
+            switch sceneWrites(for: spec, in: home) {
+            case .success(let resolvedWrites):
+                writes.append(contentsOf: resolvedWrites)
+            case .failure(let error):
+                completion(["success": false, "error": error.localizedDescription])
+                return
+            }
+        }
+
+        home.addActionSet(withName: name) { actionSet, error in
+            guard error == nil, let actionSet else {
+                completion(["success": false, "error": error?.localizedDescription ?? "Unable to create scene"])
+                return
+            }
+
+            func addWrite(at index: Int) {
+                guard index < writes.count else {
+                    completion([
+                        "success": true,
+                        "id": actionSet.uniqueIdentifier.uuidString,
+                        "scene": actionSet.name,
+                        "home": home.name,
+                        "actionCount": writes.count
+                    ])
+                    return
+                }
+
+                let write = writes[index]
+                let action = HMCharacteristicWriteAction(characteristic: write.characteristic, targetValue: write.value)
+                actionSet.addAction(action) { actionError in
+                    if let actionError {
+                        home.removeActionSet(actionSet) { _ in
+                            completion(["success": false, "error": "Unable to add scene action: \(actionError.localizedDescription)"])
+                        }
+                    } else {
+                        addWrite(at: index + 1)
+                    }
+                }
+            }
+
+            addWrite(at: 0)
+        }
+    }
+
+    func scheduleScene(name: String, homeName: String?, fireDate: Date, recurrenceMinutes: Int?, completion: @escaping ([String: Any]) -> Void) {
+        guard let (home, scene) = findScene(name: name, homeName: homeName) else {
+            completion(["success": false, "error": "Scene not found: \(name)"])
+            return
+        }
+        guard Calendar.current.component(.second, from: fireDate) == 0,
+              fireDate > Date().addingTimeInterval(60) else {
+            completion(["success": false, "error": "fire_date must be at least one minute in the future and on a whole minute"])
+            return
+        }
+        if let recurrenceMinutes, !(5...(5 * 7 * 24 * 60)).contains(recurrenceMinutes) {
+            completion(["success": false, "error": "recurrence_minutes must be between 5 and 50,400"])
+            return
+        }
+
+        let recurrence = recurrenceMinutes.map { DateComponents(minute: $0) }
+        let trigger = HMTimerTrigger(name: "\(scene.name) schedule", fireDate: fireDate, recurrence: recurrence)
+        home.addTrigger(trigger) { error in
+            if let error {
+                completion(["success": false, "error": error.localizedDescription])
+                return
+            }
+            trigger.addActionSet(scene) { actionError in
+                if let actionError {
+                    home.removeTrigger(trigger) { _ in
+                        completion(["success": false, "error": "Unable to attach scene: \(actionError.localizedDescription)"])
+                    }
+                    return
+                }
+                trigger.enable(true) { enableError in
+                    if let enableError {
+                        completion(["success": false, "error": "Schedule created but could not be enabled: \(enableError.localizedDescription)"])
+                    } else {
+                        completion([
+                            "success": true,
+                            "id": trigger.uniqueIdentifier.uuidString,
+                            "schedule": trigger.name,
+                            "scene": scene.name,
+                            "home": home.name,
+                            "fireDate": fireDate.ISO8601Format(),
+                            "recurrenceMinutes": recurrenceMinutes as Any
+                        ])
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Private Helpers
+
+    private func homes(matching homeName: String?) -> [HMHome] {
+        guard let homeName, !homeName.isEmpty else { return homeManager.homes }
+        return homeManager.homes.filter { $0.name.caseInsensitiveCompare(homeName) == .orderedSame }
+    }
+
+    private func findScene(name: String, homeName: String?) -> (HMHome, HMActionSet)? {
+        for home in homes(matching: homeName) {
+            if let scene = home.actionSets.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+                return (home, scene)
+            }
+        }
+        return nil
+    }
+
+    private func sceneWrites(for spec: [String: Any], in home: HMHome) -> Result<[(characteristic: HMCharacteristic, value: NSNumber)], NSError> {
+        guard let deviceName = spec["device"] as? String, let action = spec["action"] as? String else {
+            return .failure(sceneError("Each action needs device and action"))
+        }
+        guard let accessory = home.accessories.first(where: { $0.name.caseInsensitiveCompare(deviceName) == .orderedSame }) else {
+            return .failure(sceneError("Device not found in \(home.name): \(deviceName)"))
+        }
+
+        func characteristic(_ type: String) -> HMCharacteristic? {
+            accessory.services.lazy.flatMap(\.characteristics).first { $0.characteristicType == type }
+        }
+        func write(_ type: String, _ value: NSNumber) -> Result<[(characteristic: HMCharacteristic, value: NSNumber)], NSError> {
+            guard let characteristic = characteristic(type) else {
+                return .failure(sceneError("\(deviceName) does not support \(action)"))
+            }
+            return .success([(characteristic, value)])
+        }
+
+        switch action.lowercased() {
+        case "on", "turn_on":
+            return write(HMCharacteristicTypePowerState, NSNumber(value: true))
+        case "off", "turn_off":
+            return write(HMCharacteristicTypePowerState, NSNumber(value: false))
+        case "brightness", "set_brightness":
+            guard let value = spec["value"] as? Int ?? Int(spec["value"] as? String ?? "") else {
+                return .failure(sceneError("Brightness needs an integer value from 0 to 100"))
+            }
+            return write(HMCharacteristicTypeBrightness, NSNumber(value: min(100, max(0, value))))
+        case "target_temperature", "set_temperature":
+            guard let value = spec["value"] as? Double ?? (spec["value"] as? NSNumber)?.doubleValue else {
+                return .failure(sceneError("target_temperature needs a numeric Celsius value"))
+            }
+            return write(HMCharacteristicTypeTargetTemperature, NSNumber(value: value))
+        case "color", "set_color":
+            guard let value = spec["value"] as? [String: Any],
+                  let hue = value["hue"] as? Double ?? (value["hue"] as? NSNumber)?.doubleValue,
+                  let saturation = value["saturation"] as? Double ?? (value["saturation"] as? NSNumber)?.doubleValue,
+                  let hueCharacteristic = characteristic(HMCharacteristicTypeHue),
+                  let saturationCharacteristic = characteristic(HMCharacteristicTypeSaturation) else {
+                return .failure(sceneError("color needs hue and saturation values supported by the device"))
+            }
+            return .success([
+                (hueCharacteristic, NSNumber(value: min(360, max(0, hue)))),
+                (saturationCharacteristic, NSNumber(value: min(100, max(0, saturation))))
+            ])
+        default:
+            return .failure(sceneError("Unsupported scene action: \(action)"))
+        }
+    }
+
+    private func sceneError(_ message: String) -> NSError {
+        NSError(domain: "HomeMCPBridge.Scene", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
 
     private func findAccessory(name: String) -> (HMAccessory, HMHome)? {
         let searchName = name.lowercased()
@@ -799,7 +1035,10 @@ class HomeKitPlugin: DevicePlugin {
     var isConfigured: Bool { true }
     var configurationFields: [PluginConfigField] { [] }
 
-    private let manager = HomeKitManager.shared
+    // Do not create HMHomeManager while the app delegate is being constructed.
+    // macOS must first finish launching the signed app so TCC can present the
+    // HomeKit permission prompt against this app's bundle.
+    private var manager: HomeKitManager { HomeKitManager.shared }
 
     func initialize() async throws {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -2991,8 +3230,20 @@ class ContactSensorManager: NSObject, HMAccessoryDelegate {
 // MARK: - MCP Server
 
 class MCPServer {
-    private let homeKit = HomeKitManager.shared
+    typealias ResponseHandler = (String) -> Void
+
+    // Keep HomeKit lazy. The local bridge can answer the MCP handshake before
+    // any HomeKit API is touched, and HomeKit is then initialized by the app
+    // after it has completed its normal launch lifecycle.
+    private lazy var homeKit = HomeKitManager.shared
     private var isRunning = false
+    private let responseHandler: ResponseHandler
+
+    init(responseHandler: @escaping ResponseHandler = { line in
+        FileHandle.standardOutput.write((line + "\n").data(using: .utf8)!)
+    }) {
+        self.responseHandler = responseHandler
+    }
 
     private let tools: [[String: Any]] = [
         [
@@ -3031,6 +3282,75 @@ class MCPServer {
             "name": "list_homes",
             "description": "List all HomeKit homes configured on this Mac.",
             "inputSchema": ["type": "object", "properties": [:], "required": []]
+        ],
+        [
+            "name": "list_scenes",
+            "description": "List Apple Home scenes available to run. Optionally limit results to one home.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["home": ["type": "string", "description": "Optional HomeKit home name"]],
+                "required": []
+            ]
+        ],
+        [
+            "name": "activate_scene",
+            "description": "Run an existing Apple Home scene.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"]
+                ],
+                "required": ["name"]
+            ]
+        ],
+        [
+            "name": "create_scene",
+            "description": "Create an Apple Home scene from device actions. Actions support on, off, brightness (0-100), color ({hue, saturation}), and target_temperature (Celsius).",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "New scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"],
+                    "actions": [
+                        "type": "array",
+                        "description": "One or more device actions",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "device": ["type": "string"],
+                                "action": ["type": "string"],
+                                "value": [:]
+                            ],
+                            "required": ["device", "action"]
+                        ]
+                    ]
+                ],
+                "required": ["name", "actions"]
+            ]
+        ],
+        [
+            "name": "list_automations",
+            "description": "List Apple Home automations, including timer schedules and the scenes they run.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["home": ["type": "string", "description": "Optional HomeKit home name"]],
+                "required": []
+            ]
+        ],
+        [
+            "name": "schedule_scene",
+            "description": "Create and enable an Apple Home timer automation for an existing scene. fire_date must be ISO 8601, at least one minute ahead, and on a whole minute. recurrence_minutes is optional and must be 5 to 50,400.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Existing scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"],
+                    "fire_date": ["type": "string", "description": "ISO 8601 date and time, with seconds equal to 00"],
+                    "recurrence_minutes": ["type": "integer", "description": "Optional recurrence interval in minutes"]
+                ],
+                "required": ["name", "fire_date"]
+            ]
         ],
         // Camera tools
         [
@@ -3118,15 +3438,19 @@ class MCPServer {
 
         while isRunning {
             guard let line = readLine() else { break }
-            guard let data = line.data(using: .utf8) else { continue }
+            process(line: line)
+        }
+    }
 
-            do {
-                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    handleMessage(json)
-                }
-            } catch {
-                log("JSON parse error: \(error.localizedDescription)")
+    func process(line: String) {
+        guard let data = line.data(using: .utf8) else { return }
+
+        do {
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                handleMessage(json)
             }
+        } catch {
+            log("JSON parse error: \(error.localizedDescription)")
         }
     }
 
@@ -3200,6 +3524,62 @@ class MCPServer {
             let homes = homeKit.listHomes()
             log("  -> Found \(homes.count) homes")
             respondToolResult(id: id, result: ["homes": homes, "count": homes.count])
+
+        case "list_scenes":
+            let scenes = homeKit.listScenes(homeName: arguments["home"] as? String)
+            log("  -> Found \(scenes.count) scenes")
+            respondToolResult(id: id, result: ["scenes": scenes, "count": scenes.count])
+
+        case "activate_scene":
+            guard let sceneName = arguments["name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'name' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.activateScene(name: sceneName, homeName: arguments["home"] as? String) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out running scene"] : result)
+
+        case "create_scene":
+            guard let sceneName = arguments["name"] as? String,
+                  let actions = arguments["actions"] as? [[String: Any]] else {
+                respondToolResult(id: id, result: ["success": false, "error": "create_scene needs 'name' and an actions array"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.createScene(name: sceneName, homeName: arguments["home"] as? String, actionSpecs: actions) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 30)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out creating scene"] : result)
+
+        case "list_automations":
+            let automations = homeKit.listAutomations(homeName: arguments["home"] as? String)
+            log("  -> Found \(automations.count) automations")
+            respondToolResult(id: id, result: ["automations": automations, "count": automations.count])
+
+        case "schedule_scene":
+            guard let sceneName = arguments["name"] as? String,
+                  let fireDateString = arguments["fire_date"] as? String,
+                  let fireDate = ISO8601DateFormatter().date(from: fireDateString) else {
+                respondToolResult(id: id, result: ["success": false, "error": "schedule_scene needs a scene name and ISO 8601 fire_date"])
+                return
+            }
+            let recurrenceMinutes = arguments["recurrence_minutes"] as? Int
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.scheduleScene(name: sceneName, homeName: arguments["home"] as? String, fireDate: fireDate, recurrenceMinutes: recurrenceMinutes) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 30)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out scheduling scene"] : result)
 
         case "get_device_state":
             guard let deviceName = arguments["name"] as? String else {
@@ -3527,8 +3907,7 @@ class MCPServer {
     private func sendResponse(_ response: [String: Any]) {
         if let data = try? JSONSerialization.data(withJSONObject: response),
            let string = String(data: data, encoding: .utf8) {
-            print(string)
-            fflush(stdout)
+            responseHandler(string)
         }
     }
 
@@ -3538,6 +3917,103 @@ class MCPServer {
             return string
         }
         return "{}"
+    }
+}
+
+// MARK: - Local MCP Bridge
+
+/// HomeKit must be accessed by a normally launched, signed application. MCP
+/// clients, however, launch a command over stdio. This authenticated local
+/// bridge keeps those responsibilities separate: the app owns HomeKit and a
+/// small stdio proxy forwards each JSON-RPC request to this process.
+class LocalMCPBridge {
+    static let shared = LocalMCPBridge()
+
+    private struct Configuration: Codable {
+        let port: UInt16
+        let token: String
+    }
+
+    private let port: UInt16 = 49371
+    private let token: String
+    private var listener: NWListener?
+    private let queue = DispatchQueue(label: "com.robert.HomeMCPBridge.local-mcp")
+
+    private init() {
+        let directory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Application Support/HomeMCPBridge", isDirectory: true)
+        let configurationURL = directory.appendingPathComponent("local-mcp.json")
+
+        if let data = try? Data(contentsOf: configurationURL),
+           let configuration = try? JSONDecoder().decode(Configuration.self, from: data) {
+            token = configuration.token
+            return
+        }
+
+        token = UUID().uuidString + UUID().uuidString
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let configuration = Configuration(port: port, token: token)
+            try JSONEncoder().encode(configuration).write(to: configurationURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configurationURL.path)
+        } catch {
+            log("Unable to save local MCP configuration: \(error.localizedDescription)")
+        }
+    }
+
+    func start() {
+        guard listener == nil else { return }
+
+        do {
+            let parameters = NWParameters.tcp
+            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+            self.listener = listener
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.handle(connection)
+            }
+            listener.stateUpdateHandler = { state in
+                if case .failed(let error) = state {
+                    log("Local MCP bridge failed: \(error.localizedDescription)")
+                }
+            }
+            listener.start(queue: queue)
+            log("Local MCP bridge ready on port \(port)")
+        } catch {
+            log("Unable to start local MCP bridge: \(error.localizedDescription)")
+        }
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self, weak connection] data, _, _, error in
+            guard let self, let connection, let data, error == nil else {
+                connection?.cancel()
+                return
+            }
+            self.process(data: data, on: connection)
+        }
+    }
+
+    private func process(data: Data, on connection: NWConnection) {
+        guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let suppliedToken = envelope["token"] as? String,
+              suppliedToken == token,
+              let message = envelope["message"] as? String else {
+            connection.cancel()
+            return
+        }
+
+        let method = (try? message.data(using: .utf8).flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })?["method"] as? String
+        let server = MCPServer { [weak connection] response in
+            guard let connection else { return }
+            connection.send(content: response.data(using: .utf8), completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+        server.process(line: message)
+        if method?.hasPrefix("notifications/") == true {
+            connection.cancel()
+        }
     }
 }
 
@@ -6517,9 +6993,6 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 // MARK: - App Delegate
 
 class AppDelegate: UIResponder, UIApplicationDelegate {
-    let homeKit = HomeKitManager.shared
-    let server = MCPServer()
-
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         log("HomeMCPBridge v2.0.0 starting...")
 
@@ -6536,33 +7009,36 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         pluginManager.register(GoveePlugin())
         pluginManager.register(ScryptedPlugin())
 
-        // Initialize all enabled and configured plugins
-        Task {
-            for plugin in pluginManager.allPlugins() {
-                if plugin.isEnabled && plugin.isConfigured {
-                    do {
-                        try await plugin.initialize()
-                    } catch {
-                        log("Failed to initialize \(plugin.displayName): \(error)")
+        // Serve MCP requests from the normally launched app. A separate stdio
+        // proxy connects here, keeping HomeKit authorization in this process.
+        LocalMCPBridge.shared.start()
+
+        // HomeKit must not be initialized until UIKit has finished establishing
+        // this app's bundle and TCC context.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            let homeKit = HomeKitManager.shared
+            Task {
+                for plugin in pluginManager.allPlugins() {
+                    if plugin.isEnabled && plugin.isConfigured {
+                        do {
+                            try await plugin.initialize()
+                        } catch {
+                            log("Failed to initialize \(plugin.displayName): \(error)")
+                        }
                     }
                 }
-            }
 
-            // Subscribe to motion and contact events after HomeKit is ready
-            self.homeKit.waitUntilReady {
-                MotionSensorManager.shared.subscribeToEvents()
-                ContactSensorManager.shared.subscribeToEvents()
-                log("Motion and contact event subscriptions initialized")
+                // Subscribe to motion and contact events after HomeKit is ready
+                homeKit.waitUntilReady {
+                    MotionSensorManager.shared.subscribeToEvents()
+                    ContactSensorManager.shared.subscribeToEvents()
+                    log("Motion and contact event subscriptions initialized")
 
-                // Auto-connect to Scrypted MQTT if configured
-                if ScryptedMQTTManager.shared.isEnabled && ScryptedMQTTManager.shared.isConfigured {
-                    ScryptedMQTTManager.shared.connect()
+                    // Auto-connect to Scrypted MQTT if configured
+                    if ScryptedMQTTManager.shared.isEnabled && ScryptedMQTTManager.shared.isConfigured {
+                        ScryptedMQTTManager.shared.connect()
+                    }
                 }
-            }
-
-            // Start MCP server on background thread after plugins are initialized
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.server.run()
             }
         }
 

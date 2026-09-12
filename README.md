@@ -14,6 +14,7 @@ HomeMCPBridge is a macOS app that lets AI assistants (Claude, and others that su
 - **MCP Protocol** - Works with Claude Code, Claude Desktop, and any MCP-compatible AI
 - **All Device Types** - Lights, switches, outlets, fans, locks, garage doors, thermostats
 - **Full Control** - On/off, brightness, color (hue/saturation), lock/unlock, open/close
+- **Apple Home Scenes and Schedules** - Create, run, and time existing scenes directly in HomeKit
 - **Menu Bar App** - Runs quietly in the background with a status window
 - **Plugin System** - Extend with Govee, Scrypted NVR, and more
 - **Device Linking** - Link HomeKit devices with plugin counterparts to avoid duplicates
@@ -51,6 +52,15 @@ Download the latest `.dmg` from the [Releases](https://github.com/coalsi/HomeMCP
 
 5. Grant HomeKit access when prompted
 
+6. Install the MCP proxy. It launches the signed HomeMCPBridge app normally,
+   then forwards MCP requests to it. This is required because macOS only allows
+   HomeKit access from the app process, not from an assistant's stdio process.
+   ```bash
+   mkdir -p ~/.local/bin
+   cp scripts/home-mcp-bridge ~/.local/bin/home-mcp-bridge
+   chmod 755 ~/.local/bin/home-mcp-bridge
+   ```
+
 ## Configuration
 
 Add this to your MCP configuration file:
@@ -60,7 +70,7 @@ Add this to your MCP configuration file:
 {
   "mcpServers": {
     "homekit": {
-      "command": "/Applications/HomeMCPBridge.app/Contents/MacOS/HomeMCPBridge",
+      "command": "/Users/YOUR_MAC_USER/.local/bin/home-mcp-bridge",
       "args": []
     }
   }
@@ -72,12 +82,21 @@ Add this to your MCP configuration file:
 {
   "mcpServers": {
     "homekit": {
-      "command": "/Applications/HomeMCPBridge.app/Contents/MacOS/HomeMCPBridge",
+      "command": "/Users/YOUR_MAC_USER/.local/bin/home-mcp-bridge",
       "args": []
     }
   }
 }
 ```
+
+**For Codex:**
+```bash
+codex mcp add homekit -- ~/.local/bin/home-mcp-bridge
+```
+
+Replace `YOUR_MAC_USER` with your macOS account name. The proxy starts
+HomeMCPBridge when needed and uses a private authentication key stored in your
+user Library folder. Keep the app installed at `/Applications/HomeMCPBridge.app`.
 
 ## Usage
 
@@ -101,6 +120,11 @@ Once configured, you can ask your AI things like:
 | `list_devices` | List all devices from HomeKit and plugins |
 | `list_rooms` | List all rooms in all homes |
 | `list_homes` | List all configured HomeKit homes |
+| `list_scenes` | List Apple Home scenes |
+| `activate_scene` | Run an Apple Home scene |
+| `create_scene` | Create an Apple Home scene from supported device actions |
+| `list_automations` | List Apple Home automations |
+| `schedule_scene` | Create and enable a timer automation for an existing scene |
 | `get_device_state` | Get current state of a device |
 | `control_device` | Control a device (on, off, toggle, brightness, color, lock, unlock, open, close) |
 
@@ -139,6 +163,25 @@ Once configured, you can ask your AI things like:
 - **Cameras** - Capture snapshots
 - **Motion Sensors** - Detect motion/occupancy
 - **Contact Sensors** - Door/window open/close
+
+### Scenes and schedules
+
+`create_scene` accepts a name, an optional home name, and one or more actions. Supported scene
+actions are `on`, `off`, `brightness`, `color`, and `target_temperature`. For example:
+
+```json
+{
+  "name": "Good night",
+  "actions": [
+    {"device": "Living Room Lamp", "action": "off"},
+    {"device": "Bedroom Lamp", "action": "brightness", "value": 20}
+  ]
+}
+```
+
+Use `schedule_scene` to run an existing scene at a specific ISO 8601 time. HomeKit requires the
+time to be at least one minute ahead and on a whole minute; an optional `recurrence_minutes` can
+repeat it every 5 minutes through 5 weeks.
 
 ---
 
@@ -322,8 +365,8 @@ HomeMCPBridge:
 - Verify it shows as reachable in the Apple Home app
 
 **MCP not connecting**
-- Ensure the app is running (check the menu bar)
-- Verify the path in your MCP config matches where you installed the app
+- Verify the MCP config points to `~/.local/bin/home-mcp-bridge`, not the app's internal executable
+- Verify the app is installed at `/Applications/HomeMCPBridge.app`
 - Restart your AI assistant after changing the config
 
 **Scrypted snapshots not working**
