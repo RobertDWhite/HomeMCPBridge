@@ -10,7 +10,7 @@
     <true/>
     <key>keychain-access-groups</key>
     <array>
-		<string>AD2VN8P4JY.com.robert.HomeMCPBridge</string>
+		<string>$(AppIdentifierPrefix)$(CFBundleIdentifier)</string>
     </array>
 </dict>
 </plist>

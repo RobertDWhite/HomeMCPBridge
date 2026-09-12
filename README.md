@@ -31,13 +31,13 @@ HomeMCPBridge is a macOS app that lets AI assistants (Claude, and others that su
 ## Installation
 
 ### Option 1: Download Release
-Download the latest `.dmg` from the [Releases](https://github.com/coalsi/HomeMCPBridge/releases) page.
+Download the latest `.dmg` from the [Releases](https://github.com/RobertDWhite/HomeMCPBridge/releases) page.
 
 ### Option 2: Build from Source
 
 1. Clone this repo:
    ```bash
-   git clone https://github.com/coalsi/HomeMCPBridge.git
+   git clone https://github.com/RobertDWhite/HomeMCPBridge.git
    cd HomeMCPBridge
    ```
 
@@ -46,7 +46,9 @@ Download the latest `.dmg` from the [Releases](https://github.com/coalsi/HomeMCP
    open HomeMCPBridge.xcodeproj
    ```
 
-3. Select your development team in Signing & Capabilities
+3. In **Signing & Capabilities**, select your development team and replace the
+   example bundle ID (`com.example.HomeMCPBridge`) with a unique identifier you
+   control. Xcode will create the matching HomeKit provisioning profile.
 
 4. Build and run (Cmd+R) - select "My Mac (Mac Catalyst)"
 

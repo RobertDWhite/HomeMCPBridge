@@ -3937,7 +3937,7 @@ class LocalMCPBridge {
     private let port: UInt16 = 49371
     private let token: String
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "com.robert.HomeMCPBridge.local-mcp")
+    private let queue = DispatchQueue(label: "com.homemcpbridge.local-mcp")
 
     private init() {
         let directory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
@@ -6943,7 +6943,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
         // === Help Menu ===
         let helpAction = UIAction(title: "HomeMCPBridge Help", image: UIImage(systemName: "questionmark.circle")) { _ in
-            if let url = URL(string: "https://github.com/coalsi/HomeMCPBridge") {
+            if let url = URL(string: "https://github.com/RobertDWhite/HomeMCPBridge") {
                 UIApplication.shared.open(url)
             }
         }
