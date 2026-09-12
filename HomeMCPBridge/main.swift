@@ -387,7 +387,7 @@ class PluginManager {
         let searchName = name.lowercased()
         for plugin in activePlugins() {
             if let devices = try? await plugin.listDevices(),
-               let device = devices.first(where: { $0.name.lowercased() == searchName }) {
+               let device = devices.first(where: { $0.id == name || $0.name.lowercased() == searchName }) {
                 return (device, plugin)
             }
         }
@@ -484,6 +484,70 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
             }
         }
         return rooms
+    }
+
+    func assignDeviceRoom(deviceId: String?, name: String?, roomName: String, createRoom: Bool, completion: @escaping ([String: Any]) -> Void) {
+        var found: (HMAccessory, HMHome)?
+        if let deviceId, let uuid = UUID(uuidString: deviceId) {
+            for home in homeManager.homes {
+                if let acc = home.accessories.first(where: { $0.uniqueIdentifier == uuid }) {
+                    found = (acc, home)
+                    break
+                }
+            }
+        } else if let name {
+            found = findAccessory(name: name)
+        }
+        guard let (accessory, home) = found else {
+            completion(["success": false, "error": "Device not found: \(deviceId ?? name ?? "")"])
+            return
+        }
+
+        let previousRoom = accessory.room?.name ?? "Unknown"
+        let assign: (HMRoom) -> Void = { room in
+            home.assignAccessory(accessory, to: room) { error in
+                if let error {
+                    completion(["success": false, "error": error.localizedDescription, "device": accessory.name, "previousRoom": previousRoom])
+                } else {
+                    completion(["success": true, "device": accessory.name, "id": accessory.uniqueIdentifier.uuidString, "previousRoom": previousRoom, "room": room.name])
+                }
+            }
+        }
+
+        let target = roomName.lowercased()
+        if let room = home.rooms.first(where: { $0.name.lowercased() == target }) {
+            assign(room)
+        } else if createRoom {
+            home.addRoom(withName: roomName) { room, error in
+                if let room {
+                    assign(room)
+                } else {
+                    completion(["success": false, "error": "Could not create room '\(roomName)': \(error?.localizedDescription ?? "unknown error")"])
+                }
+            }
+        } else {
+            completion(["success": false, "error": "Room not found: \(roomName). Pass create_room=true to create it.", "availableRooms": home.rooms.map { $0.name }])
+        }
+    }
+
+    func deleteRoom(roomName: String, completion: @escaping ([String: Any]) -> Void) {
+        let target = roomName.lowercased()
+        for home in homeManager.homes {
+            guard let room = home.rooms.first(where: { $0.name.lowercased() == target }) else { continue }
+            guard room.accessories.isEmpty else {
+                completion(["success": false, "error": "Room '\(room.name)' is not empty (\(room.accessories.count) accessories)"])
+                return
+            }
+            home.removeRoom(room) { error in
+                if let error {
+                    completion(["success": false, "error": error.localizedDescription])
+                } else {
+                    completion(["success": true, "room": room.name, "home": home.name])
+                }
+            }
+            return
+        }
+        completion(["success": false, "error": "Room not found: \(roomName)"])
     }
 
     func listDevices() -> [[String: Any]] {
@@ -857,6 +921,15 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
     }
 
     private func findAccessory(name: String) -> (HMAccessory, HMHome)? {
+        // Accept an accessory uniqueIdentifier in place of a name so callers can
+        // target one of several identically named accessories.
+        if let uuid = UUID(uuidString: name) {
+            for home in homeManager.homes {
+                if let acc = home.accessories.first(where: { $0.uniqueIdentifier == uuid }) {
+                    return (acc, home)
+                }
+            }
+        }
         let searchName = name.lowercased()
         for home in homeManager.homes {
             if let acc = home.accessories.first(where: { $0.name.lowercased() == searchName }) {
@@ -1072,7 +1145,7 @@ class HomeKitPlugin: DevicePlugin {
             throw PluginError.deviceNotFound(deviceId)
         }
         return await withCheckedContinuation { cont in
-            manager.getDeviceState(name: device.name) { state in
+            manager.getDeviceState(name: device.id) { state in
                 cont.resume(returning: state)
             }
         }
@@ -1084,7 +1157,7 @@ class HomeKitPlugin: DevicePlugin {
             throw PluginError.deviceNotFound(deviceId)
         }
         let result = await withCheckedContinuation { cont in
-            manager.controlDevice(name: device.name, action: action, value: value) { res in
+            manager.controlDevice(name: device.id, action: action, value: value) { res in
                 cont.resume(returning: res)
             }
         }
@@ -3257,6 +3330,29 @@ class MCPServer {
             "inputSchema": ["type": "object", "properties": [:], "required": []]
         ],
         [
+            "name": "assign_device_room",
+            "description": "Move a HomeKit accessory into a room. Identify the accessory by 'device_id' (preferred, from list_devices) or 'name'. The room is matched by name (case-insensitive); set create_room=true to create it if missing.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "device_id": ["type": "string", "description": "Accessory id from list_devices"],
+                    "name": ["type": "string", "description": "Accessory name (used if device_id is omitted)"],
+                    "room": ["type": "string", "description": "Target room name"],
+                    "create_room": ["type": "boolean", "description": "Create the room if it does not exist (default false)"]
+                ],
+                "required": ["room"]
+            ]
+        ],
+        [
+            "name": "delete_room",
+            "description": "Delete an empty HomeKit room by name. Refuses if the room still contains accessories.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["room": ["type": "string", "description": "Room name"]],
+                "required": ["room"]
+            ]
+        ],
+        [
             "name": "get_device_state",
             "description": "Get the current state of a device (on/off, brightness, color, etc.). Works with HomeKit and Govee devices.",
             "inputSchema": [
@@ -3519,6 +3615,37 @@ class MCPServer {
             let rooms = homeKit.listRooms()
             log("  -> Found \(rooms.count) rooms")
             respondToolResult(id: id, result: ["rooms": rooms, "count": rooms.count])
+
+        case "assign_device_room":
+            guard let roomName = arguments["room"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'room' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.assignDeviceRoom(deviceId: arguments["device_id"] as? String,
+                                     name: arguments["name"] as? String,
+                                     roomName: roomName,
+                                     createRoom: arguments["create_room"] as? Bool ?? false) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out assigning room"] : result)
+
+        case "delete_room":
+            guard let roomName = arguments["room"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'room' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.deleteRoom(roomName: roomName) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting room"] : result)
 
         case "list_homes":
             let homes = homeKit.listHomes()
