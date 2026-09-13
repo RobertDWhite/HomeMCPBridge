@@ -1022,6 +1022,45 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         }
     }
 
+    /// Attach and/or detach scenes on an existing automation (trigger).
+    func updateAutomationScenes(name: String, homeName: String?, addScenes: [String], removeScenes: [String], completion: @escaping ([String: Any]) -> Void) {
+        guard let home = homes(matching: homeName).first(where: { h in h.triggers.contains { $0.name.caseInsensitiveCompare(name) == .orderedSame } }),
+              let trigger = home.triggers.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            completion(["success": false, "error": "Automation not found: \(name)"])
+            return
+        }
+        func scene(_ n: String) -> HMActionSet? { home.actionSets.first { $0.name.caseInsensitiveCompare(n) == .orderedSame } }
+        var toAdd: [HMActionSet] = []; var toRemove: [HMActionSet] = []
+        for n in addScenes { guard let sc = scene(n) else { completion(["success": false, "error": "Scene not found: \(n)"]); return }; toAdd.append(sc) }
+        for n in removeScenes { guard let sc = scene(n) else { completion(["success": false, "error": "Scene not found: \(n)"]); return }; toRemove.append(sc) }
+
+        func finish() {
+            completion(["success": true, "automation": trigger.name, "scenes": trigger.actionSets.map(\.name)])
+        }
+        func addNext(_ i: Int) {
+            guard i < toAdd.count else { finish(); return }
+            trigger.addActionSet(toAdd[i]) { error in
+                if let error { completion(["success": false, "error": "Unable to add scene '\(toAdd[i].name)': \(error.localizedDescription)"]) }
+                else { addNext(i + 1) }
+            }
+        }
+        func removeNext(_ i: Int) {
+            guard i < toRemove.count else { addNext(0); return }
+            trigger.removeActionSet(toRemove[i]) { error in
+                if let error { completion(["success": false, "error": "Unable to remove scene '\(toRemove[i].name)': \(error.localizedDescription)"]) }
+                else { removeNext(i + 1) }
+            }
+        }
+        // Add first so the trigger never ends up with no scenes attached.
+        if toAdd.isEmpty { removeNext(0) } else {
+            trigger.addActionSet(toAdd[0]) { error in
+                if let error { completion(["success": false, "error": "Unable to add scene '\(toAdd[0].name)': \(error.localizedDescription)"]); return }
+                let rest = Array(toAdd.dropFirst()); toAdd = rest
+                removeNext(0)
+            }
+        }
+    }
+
     func scheduleScene(name: String, homeName: String?, fireDate: Date, recurrenceMinutes: Int?, completion: @escaping ([String: Any]) -> Void) {
         guard let (home, scene) = findScene(name: name, homeName: homeName) else {
             completion(["success": false, "error": "Scene not found: \(name)"])
@@ -3739,6 +3778,20 @@ class MCPServer {
             ]
         ],
         [
+            "name": "update_automation",
+            "description": "Attach or detach scenes on an existing HomeKit automation (trigger), by automation name. Use list_automations to see names and current scenes.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Automation name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"],
+                    "add_scenes": ["type": "array", "items": ["type": "string"], "description": "Scene names to attach"],
+                    "remove_scenes": ["type": "array", "items": ["type": "string"], "description": "Scene names to detach"]
+                ],
+                "required": ["name"]
+            ]
+        ],
+        [
             "name": "create_scene",
             "description": "Create an Apple Home scene from device actions. Actions support on, off, brightness (0-100), color ({hue, saturation}), hue, saturation, lock, unlock, and target_temperature (Celsius). 'device' accepts an accessory id or exact name.",
             "inputSchema": [
@@ -4106,6 +4159,22 @@ class MCPServer {
             }
             _ = semaphore.wait(timeout: .now() + 20)
             respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting scene"] : result)
+
+        case "update_automation":
+            guard let autoName = arguments["name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'name' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.updateAutomationScenes(name: autoName, homeName: arguments["home"] as? String,
+                                           addScenes: arguments["add_scenes"] as? [String] ?? [],
+                                           removeScenes: arguments["remove_scenes"] as? [String] ?? []) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 30)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out updating automation"] : result)
 
         case "create_scene":
             guard let sceneName = arguments["name"] as? String,
