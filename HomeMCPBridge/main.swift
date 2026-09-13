@@ -550,6 +550,109 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         completion(["success": false, "error": "Room not found: \(roomName)"])
     }
 
+    func listGroups() -> [[String: Any]] {
+        var groups: [[String: Any]] = []
+        for home in homeManager.homes {
+            for group in home.serviceGroups {
+                groups.append([
+                    "id": group.uniqueIdentifier.uuidString,
+                    "name": group.name,
+                    "homeName": home.name,
+                    "services": group.services.map { svc -> [String: Any] in
+                        [
+                            "accessory": svc.accessory?.name ?? "Unknown",
+                            "accessoryId": svc.accessory?.uniqueIdentifier.uuidString ?? "",
+                            "service": svc.name,
+                            "type": serviceTypeName(svc.serviceType)
+                        ]
+                    }
+                ])
+            }
+        }
+        return groups
+    }
+
+    /// Group the primary controllable service of each accessory under one HMServiceGroup
+    /// (what the Home app calls "Group with Other Accessories").
+    func createGroup(name: String, deviceIds: [String], completion: @escaping ([String: Any]) -> Void) {
+        let groupableTypes = [HMServiceTypeLightbulb, HMServiceTypeSwitch, HMServiceTypeOutlet, HMServiceTypeFan]
+        var pairs: [(HMAccessory, HMHome)] = []
+        var missing: [String] = []
+        for deviceId in deviceIds {
+            if let found = findAccessory(name: deviceId) { pairs.append(found) } else { missing.append(deviceId) }
+        }
+        guard missing.isEmpty else {
+            completion(["success": false, "error": "Accessories not found: \(missing.joined(separator: ", "))"])
+            return
+        }
+        guard let home = pairs.first?.1, pairs.allSatisfy({ $0.1 == home }) else {
+            completion(["success": false, "error": "Need at least one accessory, all in the same home"])
+            return
+        }
+        if home.serviceGroups.contains(where: { $0.name.lowercased() == name.lowercased() }) {
+            completion(["success": false, "error": "A group named '\(name)' already exists"])
+            return
+        }
+        var services: [HMService] = []
+        for (accessory, _) in pairs {
+            guard let svc = accessory.services.first(where: { groupableTypes.contains($0.serviceType) }) else {
+                completion(["success": false, "error": "No groupable service on '\(accessory.name)'"])
+                return
+            }
+            services.append(svc)
+        }
+        home.addServiceGroup(withName: name) { group, error in
+            guard let group else {
+                completion(["success": false, "error": "Could not create group: \(error?.localizedDescription ?? "unknown error")"])
+                return
+            }
+            var added: [String] = []
+            var failures: [String] = []
+            let dispatch = DispatchGroup()
+            for svc in services {
+                dispatch.enter()
+                group.addService(svc) { err in
+                    if let err { failures.append("\(svc.accessory?.name ?? "?"): \(err.localizedDescription)") }
+                    else { added.append(svc.accessory?.name ?? "?") }
+                    dispatch.leave()
+                }
+            }
+            dispatch.notify(queue: .main) {
+                completion([
+                    "success": failures.isEmpty,
+                    "group": group.name,
+                    "id": group.uniqueIdentifier.uuidString,
+                    "added": added,
+                    "failures": failures
+                ])
+            }
+        }
+    }
+
+    func renameGroup(name: String, newName: String, completion: @escaping ([String: Any]) -> Void) {
+        for home in homeManager.homes {
+            guard let group = home.serviceGroups.first(where: { $0.name.lowercased() == name.lowercased() }) else { continue }
+            group.updateName(newName) { error in
+                if let error { completion(["success": false, "error": error.localizedDescription]) }
+                else { completion(["success": true, "group": newName, "previousName": name]) }
+            }
+            return
+        }
+        completion(["success": false, "error": "Group not found: \(name)"])
+    }
+
+    func deleteGroup(name: String, completion: @escaping ([String: Any]) -> Void) {
+        for home in homeManager.homes {
+            guard let group = home.serviceGroups.first(where: { $0.name.lowercased() == name.lowercased() }) else { continue }
+            home.removeServiceGroup(group) { error in
+                if let error { completion(["success": false, "error": error.localizedDescription]) }
+                else { completion(["success": true, "group": group.name]) }
+            }
+            return
+        }
+        completion(["success": false, "error": "Group not found: \(name)"])
+    }
+
     func listDevices() -> [[String: Any]] {
         var devices: [[String: Any]] = []
         for home in homeManager.homes {
@@ -3353,6 +3456,44 @@ class MCPServer {
             ]
         ],
         [
+            "name": "list_groups",
+            "description": "List HomeKit accessory groups (service groups) and their member accessories.",
+            "inputSchema": ["type": "object", "properties": [:], "required": []]
+        ],
+        [
+            "name": "create_group",
+            "description": "Group accessories together (Home app 'Group with Other Accessories'). Pass a group name and the accessory ids (or exact names) to include; each accessory's primary light/switch/outlet/fan service is added.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Group name, e.g. 'Dining Room Main'"],
+                    "device_ids": ["type": "array", "items": ["type": "string"], "description": "Accessory ids from list_devices (exact names also accepted)"]
+                ],
+                "required": ["name", "device_ids"]
+            ]
+        ],
+        [
+            "name": "rename_group",
+            "description": "Rename a HomeKit accessory group.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Current group name"],
+                    "new_name": ["type": "string", "description": "New group name"]
+                ],
+                "required": ["name", "new_name"]
+            ]
+        ],
+        [
+            "name": "delete_group",
+            "description": "Delete a HomeKit accessory group by name. Accessories are not removed, only ungrouped.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["name": ["type": "string", "description": "Group name"]],
+                "required": ["name"]
+            ]
+        ],
+        [
             "name": "get_device_state",
             "description": "Get the current state of a device (on/off, brightness, color, etc.). Works with HomeKit and Govee devices.",
             "inputSchema": [
@@ -3646,6 +3787,53 @@ class MCPServer {
             }
             _ = semaphore.wait(timeout: .now() + 20)
             respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting room"] : result)
+
+        case "list_groups":
+            let groups = homeKit.listGroups()
+            respondToolResult(id: id, result: ["groups": groups, "count": groups.count])
+
+        case "create_group":
+            guard let groupName = arguments["name"] as? String,
+                  let deviceIds = arguments["device_ids"] as? [String], !deviceIds.isEmpty else {
+                respondToolResult(id: id, result: ["success": false, "error": "create_group needs 'name' and a non-empty 'device_ids' array"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.createGroup(name: groupName, deviceIds: deviceIds) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 30)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out creating group"] : result)
+
+        case "rename_group":
+            guard let groupName = arguments["name"] as? String, let newName = arguments["new_name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "rename_group needs 'name' and 'new_name'"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.renameGroup(name: groupName, newName: newName) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out renaming group"] : result)
+
+        case "delete_group":
+            guard let groupName = arguments["name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'name' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.deleteGroup(name: groupName) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting group"] : result)
 
         case "list_homes":
             let homes = homeKit.listHomes()
