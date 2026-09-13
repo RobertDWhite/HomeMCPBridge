@@ -33,7 +33,7 @@ def load_config():
 
 def forward(message, config, expect_response=True):
     envelope = json.dumps({"token": config["token"], "message": message}).encode("utf-8")
-    with socket.create_connection(("127.0.0.1", config["port"]), timeout=10) as client:
+    with socket.create_connection(("127.0.0.1", config["port"]), timeout=300) as client:
         client.sendall(envelope)
         client.shutdown(socket.SHUT_WR)
         chunks = []

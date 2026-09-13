@@ -905,6 +905,123 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         }
     }
 
+    func getScene(name: String, homeName: String?) -> [String: Any] {
+        guard let (home, scene) = findScene(name: name, homeName: homeName) else {
+            return ["success": false, "error": "Scene not found: \(name)"]
+        }
+        let actions: [[String: Any]] = scene.actions.compactMap { action in
+            guard let write = action as? HMCharacteristicWriteAction<NSCopying> else { return nil }
+            let characteristic = write.characteristic
+            let accessory = characteristic.service?.accessory
+            return [
+                "device": accessory?.name ?? "Unknown",
+                "deviceId": accessory?.uniqueIdentifier.uuidString ?? "",
+                "room": accessory?.room?.name ?? "Unknown",
+                "characteristic": characteristicName(characteristic.characteristicType),
+                "value": write.targetValue
+            ]
+        }
+        return [
+            "success": true,
+            "id": scene.uniqueIdentifier.uuidString,
+            "scene": scene.name,
+            "home": home.name,
+            "actionCount": actions.count,
+            "actions": actions
+        ]
+    }
+
+    /// Replace every action on an existing scene with the given action specs.
+    func updateScene(name: String, homeName: String?, actionSpecs: [[String: Any]], replace: Bool = true, completion: @escaping ([String: Any]) -> Void) {
+        guard let (home, actionSet) = findScene(name: name, homeName: homeName) else {
+            completion(["success": false, "error": "Scene not found: \(name)"])
+            return
+        }
+        guard replace || !actionSpecs.isEmpty else {
+            completion(["success": false, "error": "Nothing to append: actions is empty"])
+            return
+        }
+
+        var writes: [(characteristic: HMCharacteristic, value: NSNumber)] = []
+        for spec in actionSpecs {
+            switch sceneWrites(for: spec, in: home) {
+            case .success(let resolvedWrites):
+                writes.append(contentsOf: resolvedWrites)
+            case .failure(let error):
+                completion(["success": false, "error": error.localizedDescription])
+                return
+            }
+        }
+
+        let existing = replace ? Array(actionSet.actions) : []
+        let removedCount = existing.count
+
+        func addWrite(at index: Int) {
+            guard index < writes.count else {
+                completion([
+                    "success": true,
+                    "id": actionSet.uniqueIdentifier.uuidString,
+                    "scene": actionSet.name,
+                    "home": home.name,
+                    "removedActions": removedCount,
+                    "actionCount": writes.count
+                ])
+                return
+            }
+            let write = writes[index]
+            let action = HMCharacteristicWriteAction(characteristic: write.characteristic, targetValue: write.value)
+            actionSet.addAction(action) { actionError in
+                if let actionError {
+                    completion(["success": false, "error": "Unable to add scene action (\(index + 1)/\(writes.count)): \(actionError.localizedDescription)", "removedActions": removedCount, "addedActions": index])
+                } else {
+                    addWrite(at: index + 1)
+                }
+            }
+        }
+
+        func removeExisting(at index: Int) {
+            guard index < existing.count else {
+                addWrite(at: 0)
+                return
+            }
+            actionSet.removeAction(existing[index]) { removeError in
+                if let removeError {
+                    completion(["success": false, "error": "Unable to remove existing action (\(index + 1)/\(existing.count)): \(removeError.localizedDescription)"])
+                } else {
+                    removeExisting(at: index + 1)
+                }
+            }
+        }
+
+        removeExisting(at: 0)
+    }
+
+    func renameScene(name: String, newName: String, homeName: String?, completion: @escaping ([String: Any]) -> Void) {
+        guard let (home, scene) = findScene(name: name, homeName: homeName) else {
+            completion(["success": false, "error": "Scene not found: \(name)"])
+            return
+        }
+        guard home.actionSets.allSatisfy({ $0 == scene || $0.name.caseInsensitiveCompare(newName) != .orderedSame }) else {
+            completion(["success": false, "error": "A scene named '\(newName)' already exists in \(home.name)"])
+            return
+        }
+        scene.updateName(newName) { error in
+            if let error { completion(["success": false, "error": error.localizedDescription]) }
+            else { completion(["success": true, "scene": newName, "previousName": name, "home": home.name]) }
+        }
+    }
+
+    func deleteScene(name: String, homeName: String?, completion: @escaping ([String: Any]) -> Void) {
+        guard let (home, scene) = findScene(name: name, homeName: homeName) else {
+            completion(["success": false, "error": "Scene not found: \(name)"])
+            return
+        }
+        home.removeActionSet(scene) { error in
+            if let error { completion(["success": false, "error": error.localizedDescription]) }
+            else { completion(["success": true, "scene": scene.name, "home": home.name]) }
+        }
+    }
+
     func scheduleScene(name: String, homeName: String?, fireDate: Date, recurrenceMinutes: Int?, completion: @escaping ([String: Any]) -> Void) {
         guard let (home, scene) = findScene(name: name, homeName: homeName) else {
             completion(["success": false, "error": "Scene not found: \(name)"])
@@ -973,7 +1090,10 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         guard let deviceName = spec["device"] as? String, let action = spec["action"] as? String else {
             return .failure(sceneError("Each action needs device and action"))
         }
-        guard let accessory = home.accessories.first(where: { $0.name.caseInsensitiveCompare(deviceName) == .orderedSame }) else {
+        let deviceUUID = UUID(uuidString: deviceName)
+        guard let accessory = home.accessories.first(where: {
+            (deviceUUID != nil && $0.uniqueIdentifier == deviceUUID) || $0.name.caseInsensitiveCompare(deviceName) == .orderedSame
+        }) else {
             return .failure(sceneError("Device not found in \(home.name): \(deviceName)"))
         }
 
@@ -1014,6 +1134,20 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
                 (hueCharacteristic, NSNumber(value: min(360, max(0, hue)))),
                 (saturationCharacteristic, NSNumber(value: min(100, max(0, saturation))))
             ])
+        case "hue", "set_hue":
+            guard let value = spec["value"] as? Double ?? (spec["value"] as? NSNumber)?.doubleValue else {
+                return .failure(sceneError("hue needs a numeric value from 0 to 360"))
+            }
+            return write(HMCharacteristicTypeHue, NSNumber(value: min(360, max(0, value))))
+        case "saturation", "set_saturation":
+            guard let value = spec["value"] as? Double ?? (spec["value"] as? NSNumber)?.doubleValue else {
+                return .failure(sceneError("saturation needs a numeric value from 0 to 100"))
+            }
+            return write(HMCharacteristicTypeSaturation, NSNumber(value: min(100, max(0, value))))
+        case "lock":
+            return write(HMCharacteristicTypeTargetLockMechanismState, NSNumber(value: HMCharacteristicValueLockMechanismState.secured.rawValue))
+        case "unlock":
+            return write(HMCharacteristicTypeTargetLockMechanismState, NSNumber(value: HMCharacteristicValueLockMechanismState.unsecured.rawValue))
         default:
             return .failure(sceneError("Unsupported scene action: \(action)"))
         }
@@ -3542,8 +3676,71 @@ class MCPServer {
             ]
         ],
         [
+            "name": "get_scene",
+            "description": "Show the actions in an Apple Home scene: each target accessory, its room, the characteristic written, and the value.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"]
+                ],
+                "required": ["name"]
+            ]
+        ],
+        [
+            "name": "update_scene",
+            "description": "Replace all actions of an existing Apple Home scene (keeps the scene's identity so automations and Siri references survive). Same action format as create_scene; 'device' accepts an accessory id or exact name. An empty actions list with replace=true clears the scene.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Existing scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"],
+                    "replace": ["type": "boolean", "description": "Remove existing actions first (default true). Set false to append."],
+                    "actions": [
+                        "type": "array",
+                        "description": "Replacement device actions",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "device": ["type": "string"],
+                                "action": ["type": "string"],
+                                "value": [:]
+                            ],
+                            "required": ["device", "action"]
+                        ]
+                    ]
+                ],
+                "required": ["name", "actions"]
+            ]
+        ],
+        [
+            "name": "rename_scene",
+            "description": "Rename an Apple Home scene.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Current scene name"],
+                    "new_name": ["type": "string", "description": "New scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"]
+                ],
+                "required": ["name", "new_name"]
+            ]
+        ],
+        [
+            "name": "delete_scene",
+            "description": "Delete an Apple Home scene by name.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Scene name"],
+                    "home": ["type": "string", "description": "Optional HomeKit home name"]
+                ],
+                "required": ["name"]
+            ]
+        ],
+        [
             "name": "create_scene",
-            "description": "Create an Apple Home scene from device actions. Actions support on, off, brightness (0-100), color ({hue, saturation}), and target_temperature (Celsius).",
+            "description": "Create an Apple Home scene from device actions. Actions support on, off, brightness (0-100), color ({hue, saturation}), hue, saturation, lock, unlock, and target_temperature (Celsius). 'device' accepts an accessory id or exact name.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -3858,6 +4055,57 @@ class MCPServer {
             }
             _ = semaphore.wait(timeout: .now() + 20)
             respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out running scene"] : result)
+
+        case "get_scene":
+            guard let sceneName = arguments["name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'name' parameter"])
+                return
+            }
+            respondToolResult(id: id, result: homeKit.getScene(name: sceneName, homeName: arguments["home"] as? String))
+
+        case "update_scene":
+            guard let sceneName = arguments["name"] as? String,
+                  let actions = arguments["actions"] as? [[String: Any]] else {
+                respondToolResult(id: id, result: ["success": false, "error": "update_scene needs 'name' and an actions array"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.updateScene(name: sceneName, homeName: arguments["home"] as? String, actionSpecs: actions,
+                                replace: arguments["replace"] as? Bool ?? true) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 180)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out updating scene"] : result)
+
+        case "rename_scene":
+            guard let sceneName = arguments["name"] as? String, let newName = arguments["new_name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "rename_scene needs 'name' and 'new_name'"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.renameScene(name: sceneName, newName: newName, homeName: arguments["home"] as? String) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out renaming scene"] : result)
+
+        case "delete_scene":
+            guard let sceneName = arguments["name"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'name' parameter"])
+                return
+            }
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.deleteScene(name: sceneName, homeName: arguments["home"] as? String) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 20)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting scene"] : result)
 
         case "create_scene":
             guard let sceneName = arguments["name"] as? String,
