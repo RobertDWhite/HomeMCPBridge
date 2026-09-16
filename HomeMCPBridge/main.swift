@@ -550,6 +550,61 @@ class HomeKitManager: NSObject, HMHomeManagerDelegate {
         completion(["success": false, "error": "Room not found: \(roomName)"])
     }
 
+    /// Bridges (accessories that expose other accessories) and the accessories behind them.
+    func listBridges() -> [[String: Any]] {
+        var bridges: [[String: Any]] = []
+        for home in homeManager.homes {
+            let byId = Dictionary(uniqueKeysWithValues: home.accessories.map { ($0.uniqueIdentifier, $0) })
+            for acc in home.accessories {
+                guard let childIds = acc.uniqueIdentifiersForBridgedAccessories, !childIds.isEmpty else { continue }
+                let children: [[String: Any]] = childIds.map { cid in
+                    if let c = byId[cid] {
+                        return ["id": cid.uuidString, "name": c.name, "reachable": c.isReachable, "room": c.room?.name ?? "Unknown"]
+                    }
+                    return ["id": cid.uuidString, "name": "(unknown)", "reachable": false]
+                }
+                bridges.append([
+                    "id": acc.uniqueIdentifier.uuidString,
+                    "name": acc.name,
+                    "manufacturer": acc.manufacturer ?? "Unknown",
+                    "model": acc.model ?? "Unknown",
+                    "reachable": acc.isReachable,
+                    "homeName": home.name,
+                    "childCount": children.count,
+                    "children": children
+                ])
+            }
+        }
+        return bridges
+    }
+
+    /// Remove an accessory from its home (Home app "Remove Accessory"). A bridge takes every
+    /// accessory it bridges with it, so bridges are refused unless force is set.
+    func removeAccessory(deviceId: String, force: Bool, completion: @escaping ([String: Any]) -> Void) {
+        guard let uuid = UUID(uuidString: deviceId) else {
+            completion(["success": false, "error": "device_id must be an accessory id from list_devices"])
+            return
+        }
+        for home in homeManager.homes {
+            guard let acc = home.accessories.first(where: { $0.uniqueIdentifier == uuid }) else { continue }
+            let bridgedCount = acc.uniqueIdentifiersForBridgedAccessories?.count ?? 0
+            if bridgedCount > 0 && !force {
+                completion(["success": false, "error": "'\(acc.name)' is a bridge exposing \(bridgedCount) accessories; removing it removes all of them. Pass force=true to confirm.", "isBridge": true, "bridgedCount": bridgedCount])
+                return
+            }
+            let info: [String: Any] = ["id": deviceId, "name": acc.name, "wasReachable": acc.isReachable, "isBridged": acc.isBridged, "isBridge": bridgedCount > 0, "home": home.name]
+            home.removeAccessory(acc) { error in
+                if let error {
+                    completion(info.merging(["success": false, "error": error.localizedDescription]) { $1 })
+                } else {
+                    completion(info.merging(["success": true]) { $1 })
+                }
+            }
+            return
+        }
+        completion(["success": false, "error": "Accessory not found: \(deviceId)"])
+    }
+
     func listGroups() -> [[String: Any]] {
         var groups: [[String: Any]] = []
         for home in homeManager.homes {
@@ -3629,6 +3684,23 @@ class MCPServer {
             ]
         ],
         [
+            "name": "list_bridges",
+            "description": "List HomeKit bridges (Homebridge, Scrypted, Home Assistant, Hue, ...) with reachability and the accessories each one exposes. Use it to tell stale accessories from live ones before remove_device.",
+            "inputSchema": ["type": "object", "properties": [:], "required": []]
+        ],
+        [
+            "name": "remove_device",
+            "description": "Remove an accessory from Apple Home (same as 'Remove Accessory' in the Home app). Identify it by 'device_id' from list_devices. Refuses to remove a bridge unless force=true, because removing a bridge removes every accessory behind it. Irreversible: a removed accessory must be re-paired to come back.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "device_id": ["type": "string", "description": "Accessory id from list_devices"],
+                    "force": ["type": "boolean", "description": "Allow removing a bridge and everything it exposes (default false)"]
+                ],
+                "required": ["device_id"]
+            ]
+        ],
+        [
             "name": "list_groups",
             "description": "List HomeKit accessory groups (service groups) and their member accessories.",
             "inputSchema": ["type": "object", "properties": [:], "required": []]
@@ -4037,6 +4109,25 @@ class MCPServer {
             }
             _ = semaphore.wait(timeout: .now() + 20)
             respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out deleting room"] : result)
+
+        case "list_bridges":
+            let bridges = homeKit.listBridges()
+            respondToolResult(id: id, result: ["bridges": bridges, "count": bridges.count])
+
+        case "remove_device":
+            guard let deviceId = arguments["device_id"] as? String else {
+                respondToolResult(id: id, result: ["success": false, "error": "Missing 'device_id' parameter"])
+                return
+            }
+            let force = arguments["force"] as? Bool ?? false
+            var result: [String: Any] = [:]
+            let semaphore = DispatchSemaphore(value: 0)
+            homeKit.removeAccessory(deviceId: deviceId, force: force) { response in
+                result = response
+                semaphore.signal()
+            }
+            _ = semaphore.wait(timeout: .now() + 30)
+            respondToolResult(id: id, result: result.isEmpty ? ["success": false, "error": "Timed out removing accessory"] : result)
 
         case "list_groups":
             let groups = homeKit.listGroups()
